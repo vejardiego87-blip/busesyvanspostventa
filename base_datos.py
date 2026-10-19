@@ -1,80 +1,164 @@
-"""Historial SQLite: datos y textos del informe, sin documentos ni fotografías."""
-from contextlib import closing
-from datetime import datetime
-from pathlib import Path
-from zoneinfo import ZoneInfo
-import os
+"""Persistencia de informes técnicos en Google Sheets (solo textos)."""
+import json
 import re
-import sqlite3
-import tempfile
+from datetime import datetime
+from io import BytesIO
+from threading import RLock
+from zoneinfo import ZoneInfo
 
-RUTA_DB = Path(os.environ.get('FOTON_DB_PATH', str(Path(__file__).parent / 'datos' / 'informes_foton.db')))
+import gspread
+import streamlit as st
+from google.oauth2.service_account import Credentials
 
-def conectar(ruta=None):
-    ruta = Path(ruta or RUTA_DB)
-    ruta.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(str(ruta), timeout=60)
-    c.row_factory = sqlite3.Row
-    return c
+LOCK = RLock()  # Protege hilos de una instancia, no distintas instancias de Streamlit.
+COLUMNAS = ['numero','fecha','modelo','vin','patente','marca','sistema','motivo','entidades','analisis','responsable','cargo','correo','firma','creado_en','actualizado_en','estado']
+CONTADORES = ['prefijo','ultimo_numero']
 
-def inicializar(ruta=None):
-    with closing(conectar(ruta)) as c, c:
-        c.execute('BEGIN IMMEDIATE')
-        c.execute('''CREATE TABLE IF NOT EXISTS informes (
-            id INTEGER PRIMARY KEY, prefijo TEXT NOT NULL, secuencia INTEGER NOT NULL,
-            numero TEXT NOT NULL UNIQUE, huella TEXT NOT NULL UNIQUE,
-            creado_en TEXT NOT NULL, fecha TEXT NOT NULL, modelo TEXT NOT NULL,
-            vin TEXT NOT NULL, patente TEXT NOT NULL, sistema TEXT NOT NULL,
-            responsable TEXT NOT NULL, correo TEXT NOT NULL,
-            UNIQUE(prefijo, secuencia))''')
-        existentes = {fila[1] for fila in c.execute('PRAGMA table_info(informes)')}
-        for campo in ('motivo', 'entidades', 'analisis', 'cargo'):
-            if campo not in existentes:
-                c.execute(f"ALTER TABLE informes ADD COLUMN {campo} TEXT NOT NULL DEFAULT ''")
 
-def guardar_informe(datos, fotos, prefijo, huella, generador, ruta=None):
-    """Reintentar el mismo contenido devuelve el informe existente sin consumir número."""
-    if not re.fullmatch(r'[A-Z]{2}', prefijo):
-        raise ValueError('Prefijo inválido')
-    inicializar(ruta)
-    with closing(conectar(ruta)) as c:
+def _ahora():
+    return datetime.now(ZoneInfo('America/Santiago')).strftime('%Y-%m-%d %H:%M:%S')
+
+
+@st.cache_resource(show_spinner=False)
+def _hojas():
+    if 'gcp_service_account' in st.secrets:
+        credenciales = dict(st.secrets['gcp_service_account'])
+    elif 'gcp' in st.secrets and 'credentials_json' in st.secrets['gcp']:
+        credenciales = json.loads(st.secrets['gcp']['credentials_json'])
+    else:
+        raise RuntimeError('Faltan credenciales [gcp_service_account] o [gcp].credentials_json en Secrets.')
+    credenciales['private_key'] = credenciales['private_key'].replace('\\n', '\n')
+    scopes = ['https://www.googleapis.com/auth/spreadsheets']
+    cliente = gspread.authorize(Credentials.from_service_account_info(credenciales, scopes=scopes))
+    libro = cliente.open_by_key(st.secrets['google_sheets']['spreadsheet_id'])
+    informes = libro.worksheet('Informes')
+    correlativos = libro.worksheet('Correlativos')
+    return informes, correlativos
+
+
+def _preparar():
+    informes, correlativos = _hojas()
+    encabezados = informes.row_values(1)
+    if not encabezados:
+        informes.update(range_name='A1:Q1', values=[COLUMNAS])
+    elif encabezados != COLUMNAS:
+        # No sobrescribir columnas existentes, porque podría perderse información.
+        raise RuntimeError('Los encabezados de la pestaña Informes no coinciden con los requeridos. Usa el botón "Copiar encabezados" de las instrucciones y reemplaza únicamente la fila 1 después de revisar si existen datos.')
+    encabezados_c = correlativos.row_values(1)
+    if not encabezados_c:
+        correlativos.update(range_name='A1:B1', values=[CONTADORES])
+    elif [x.lower() for x in encabezados_c[:2]] not in ([x.lower() for x in CONTADORES], ['prefijo','último número'], ['prefijo','ultimo_numero']):
+        raise RuntimeError('La hoja Correlativos debe comenzar con prefijo y ultimo_numero.')
+    return informes, correlativos
+
+
+def listar_informes(incluir_eliminados=False):
+    informes, _ = _preparar()
+    filas = informes.get_all_records(expected_headers=COLUMNAS, numericise_ignore=['all'])
+    filas = [{k: str(r.get(k, '') or '') for k in COLUMNAS} for r in filas if r.get('numero')]
+    if not incluir_eliminados:
+        filas = [r for r in filas if r['estado'].lower() != 'eliminado']
+    return list(reversed(filas))
+
+
+def _siguiente(prefijo, informes, correlativos):
+    valores = correlativos.get_all_values()
+    fila_contador = next((i for i, fila in enumerate(valores[1:], 2) if fila and fila[0].strip().upper() == prefijo), None)
+    valor = 0
+    if fila_contador:
         try:
-            c.execute('BEGIN IMMEDIATE')
-            existente = c.execute('SELECT numero FROM informes WHERE huella=?', (huella,)).fetchone()
-            if existente:
-                documento = generador(dict(datos, numero_informe=existente['numero']), fotos)
-                c.commit()
-                return dict(numero=existente['numero'], documento=documento,
-                            nombre_archivo=f"Informe_Foton_{existente['numero']}.docx"), False
-            siguiente = c.execute('SELECT COALESCE(MAX(secuencia),0)+1 FROM informes WHERE prefijo=?', (prefijo,)).fetchone()[0]
-            numero = f'{prefijo}-{siguiente:04d}'
-            datos = dict(datos, numero_informe=numero)
-            documento = generador(datos, fotos)
-            if not documento:
-                raise ValueError('Documento vacío')
-            identificador = re.sub(r'[^A-Za-z0-9_-]', '', datos.get('patente') or datos.get('vin') or 'unidad')
-            nombre = f'Informe_Foton_{numero}_{identificador}.docx'
-            creado = datetime.now(ZoneInfo('America/Santiago')).isoformat(timespec='seconds')
-            c.execute('''INSERT INTO informes
-                (prefijo,secuencia,numero,huella,creado_en,fecha,modelo,vin,patente,sistema,responsable,correo,motivo,entidades,analisis,cargo)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (prefijo,siguiente,numero,huella,creado,datos['fecha'],datos['modelo'],datos['vin'],datos['patente'],datos['sistema'],datos['responsable'],datos['correo'],datos.get('motivo',''),datos.get('entidades',''),datos.get('analisis',''),datos.get('cargo','')))
-            c.commit()
-            return dict(numero=numero,nombre_archivo=nombre,documento=documento), True
-        except Exception:
-            c.rollback()
-            raise
+            valor = int(valores[fila_contador-1][1])
+        except (ValueError, IndexError):
+            pass
+    # Considerar también números de informes eliminados para no reutilizarlos.
+    for fila in informes.get_all_records(numericise_ignore=['all']):
+        numero = str(fila.get('numero', ''))
+        if re.fullmatch(rf'{re.escape(prefijo)}-\d+', numero):
+            valor = max(valor, int(numero.split('-')[-1]))
+    return valor + 1, fila_contador
 
-def listar_informes(ruta=None):
-    inicializar(ruta)
-    with closing(conectar(ruta)) as c:
-        return [dict(r) for r in c.execute('''SELECT numero,fecha,modelo,vin,patente,sistema,responsable,cargo,correo,motivo,entidades,analisis,creado_en
-            FROM informes ORDER BY id DESC''')]
 
-def respaldo_base(ruta=None):
-    """Copia consistente usando la API backup, incluso con escrituras concurrentes."""
-    with tempfile.TemporaryDirectory() as carpeta:
-        destino = Path(carpeta) / 'respaldo.db'
-        with closing(conectar(ruta)) as origen, closing(sqlite3.connect(destino)) as copia:
-            origen.backup(copia)
-        return destino.read_bytes()
+def guardar_informe(datos, fotos, prefijo, firma, generar_informe):
+    """Devuelve ({documento, nombre_archivo, numero}, nuevo).
+
+    El documento Word se genera en memoria; nunca se sube a Google Sheets.
+    """
+    with LOCK:
+        informes, correlativos = _preparar()
+        registros = listar_informes(incluir_eliminados=True)
+        existente = next((r for r in registros if r['firma'] == firma and r['estado'].lower() != 'eliminado'), None)
+        if existente:
+            numero, nuevo = existente['numero'], False
+        else:
+            siguiente, fila_contador = _siguiente(prefijo, informes, correlativos)
+            numero, nuevo = f'{prefijo}-{siguiente:04d}', True
+        datos_doc = dict(datos, numero=numero)
+        # Contrato del generador original: generar_informe(datos, fotos).
+        resultado = generar_informe(datos_doc, fotos)
+        if isinstance(resultado, dict):
+            documento = resultado.get('documento')
+            nombre_archivo = resultado.get('nombre_archivo', f'Informe_{numero}.docx')
+        elif isinstance(resultado, (tuple, list)) and len(resultado) >= 2:
+            documento, nombre_archivo = resultado[:2]
+        else:
+            documento, nombre_archivo = resultado, f'Informe_{numero}.docx'
+        if hasattr(documento, 'getvalue'):
+            documento = documento.getvalue()
+        elif hasattr(documento, 'read'):
+            documento = documento.read()
+        if not isinstance(documento, bytes):
+            raise TypeError('generar_informe debe devolver bytes, un BytesIO, un dict o una tupla con el Word.')
+        if nuevo:
+            momento = _ahora()
+            registro = dict(datos, numero=numero, marca='FOTON', firma=firma, creado_en=momento, actualizado_en=momento, estado='Activo')
+            informes.append_row([str(registro.get(k, '')) for k in COLUMNAS], value_input_option='RAW')
+            # Contador se actualiza después del guardado, y el próximo cálculo también revisa el historial.
+            if fila_contador:
+                correlativos.update_cell(fila_contador, 2, siguiente)
+            else:
+                correlativos.append_row([prefijo, siguiente], value_input_option='RAW')
+        return {'documento': documento, 'nombre_archivo': nombre_archivo, 'numero': numero}, nuevo
+
+
+def actualizar_informe(numero, cambios):
+    permitidos = {'fecha','modelo','vin','patente','sistema','motivo','entidades','analisis'}
+    with LOCK:
+        hoja, _ = _preparar()
+        filas = hoja.get_all_values()
+        for indice, fila in enumerate(filas[1:], 2):
+            if fila and fila[0] == numero:
+                actual = dict(zip(COLUMNAS, fila + [''] * len(COLUMNAS)))
+                if actual['estado'].lower() == 'eliminado':
+                    raise ValueError('No se puede editar un informe eliminado.')
+                actual.update({k: str(v) for k, v in cambios.items() if k in permitidos})
+                actual['actualizado_en'] = _ahora()
+                # Firma anterior no debe impedir guardar una versión corregida.
+                actual['firma'] = ''
+                hoja.update(range_name=f'A{indice}:Q{indice}', values=[[actual[k] for k in COLUMNAS]])
+                return
+        raise ValueError('No se encontró el informe.')
+
+
+def eliminar_informe(numero):
+    """Eliminación lógica: conserva textos y correlativo para auditoría."""
+    with LOCK:
+        hoja, _ = _preparar()
+        filas = hoja.get_all_values()
+        for indice, fila in enumerate(filas[1:], 2):
+            if fila and fila[0] == numero:
+                hoja.update(range_name=f'Q{indice}', values=[['Eliminado']])
+                hoja.update(range_name=f'P{indice}', values=[[_ahora()]])
+                return
+        raise ValueError('No se encontró el informe.')
+
+
+def respaldo_base():
+    """Respaldo CSV (solo textos); no es un archivo SQLite."""
+    import csv
+    from io import StringIO
+    salida = StringIO()
+    escritor = csv.DictWriter(salida, fieldnames=COLUMNAS)
+    escritor.writeheader()
+    for fila in listar_informes(incluir_eliminados=True):
+        escritor.writerow({k: "'" + v if v.lstrip().startswith(('=', '+', '-', '@')) else v for k, v in fila.items()})
+    return salida.getvalue().encode('utf-8-sig')
