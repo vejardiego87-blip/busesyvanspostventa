@@ -4,3 +4,5 @@ Pillow>=10.4,<13
 tzdata>=2024.1
 gspread
 google-auth
+gspread>=6.1,<7
+google-auth>=2.0,<3
